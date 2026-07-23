@@ -1,0 +1,771 @@
+# Auto-Place для активного PvP: архитектура и прототип
+
+Прежде чем код — разбор механик, которые **ломают** наивные авто-плейсы, и как их обойти. Именно из них вытекает архитектура.
+
+---
+
+## Часть 1. Механики, которые надо учесть
+
+### 1.1 Плейс — это не «выстрел», это транзакция
+В moomoo плейс = выбор предмета → пакет с углом → сервер валидирует коллизию → объект появился **или молча нет**. Наивные скрипты шлют пакет и верят. Идеальный — **проверяет, появился ли объект**, и если нет — ищет соседний свободный угол. Плюс после плейса надо вернуть оружие в руку, иначе следующий удар пропадёт.
+
+### 1.2 Запрещённые дуги (ключевая геометрия)
+Объект нельзя поставить, если он пересечёт существующий. Для **каждого** объекта рядом это выкусывает дугу углов аналитически, без перебора:
+
+Объект `O` на расстоянии `D` от игрока под углом `φ`, его радиус `r`, ставим предмет радиуса `s` на дистанции плейса `d`. Точка плейса пересекает объект, когда:
+
+```
+D² + d² − 2·D·d·cos(θ − φ) < (r + s)²
+```
+
+Отсюда запрещённая дуга:
+
+```
+Δ = arccos( (D² + d² − (r+s)²) / (2·D·d) )   →   θ ∈ (φ − Δ, φ + Δ)
+```
+
+Собираем дуги от всех соседних объектов → получаем карту свободных углов → берём свободный угол, **ближайший к желаемому**. Это и есть сердце системы: она никогда не шлёт заведомо мёртвый пакет.
+
+### 1.3 Неочевидное: концентричность трапа
+Считаем честно. Враг в трапе ≈ в его центре. Чтобы шип **коснулся** врага, его центру надо быть ближе `s_spike + s_player` к врагу. Но чтобы шип **вообще встал**, ему надо быть дальше `s_spike + s_trap` от центра трапа. При типичных константах:
+
+```
+нужно ≤ (25.5 + 35) = 60.5 до врага
+нужно ≥ (25.5 + 50) = 75.5 до трапа
+```
+
+Враг в центре трапа → **невозможно одновременно**. Вывод, который меняет логику: **шипы вокруг трапнутого врага не наносят урон — они запирают выход**. Урон случится, когда трап сломается и врага вытолкнет/он двинется. Значит, при трапнутом враге приоритет — **закрыть дугу побега**, а не «шип в лицо».
+
+То же зеркально: **ты сам в трапе** → шип на дистанции 60.5 от тебя не пройдёт валидацию против трапа (нужно 75.5), **если трап концентричен тебе**. Но в трапе есть люфт — можно прижаться к краю. Прижался к краю в сторону врага → расстояние от тебя до центра трапа стало ~15-20 → окно углов открывается. Композер должен это знать и выдавать **подсказку движения**, а не тупо спамить фейлящиеся пакеты.
+
+### 1.4 Упреждение
+Между твоим «решением» и появлением объекта: пинг туда + тик сервера. За это время враг со скоростью бега сместится. Считаем всё от **экстраполированных** позиций: своей и вражеской. Скорость — по истории позиций с EMA-сглаживанием, чтобы отскок от удара (резкий выброс скорости) не ломал предсказание, но при этом кнокбэк — это **сигнал**: враг только что получил/нанёс удар, его траектория на 2-3 тика предсказуема (летит по вектору кнокбэка) — это лучший момент для трапа по упреждению.
+
+### 1.5 Ресурсы — это здоровье
+Спам шипами = через 30 секунд боя у тебя ноль ресурсов и ты труп. Каждый плейс проходит через бюджет: резерв на анти-инсту неприкосновенен.
+
+---
+
+## Часть 2. Архитектура
+
+```
+[WorldTracker]  →  [Assessor]  →  [Composer]  →  [Executor]
+ позиции,           ситуация:      план:          очередь, валидация
+ скорости,          кто в трапе,   что, куда,     дуг, верификация,
+ объекты,           дистанция,     приоритет      ретраи, бюджет
+ свои постройки     вектор боя                    пакетов
+```
+
+Композер — **приоритетная машина состояний**, не скоринг. В PvP решение нужно за один тик, и сценарии дискретны.
+
+---
+
+## Часть 3. Прототип
+
+```js
+/* ============================================================
+ * CONFIG — все константы образные, подставь свои
+ * ============================================================ */
+const CFG = {
+    PLAYER_SCALE:  35,           // радиус игрока
+    ITEMS: {                     // scale по слотам
+        SPIKE: { slot: 2, scale: SPIKE_SCALE },
+        TRAP:  { slot: 4, scale: TRAP_SCALE  },
+    },
+    PLACE_DIST: (itemScale) => CFG.PLAYER_SCALE + itemScale, // + offset если есть
+
+    PING_MS:            () => window.pingTime || 100,  // актуальный пинг
+    SERVER_TICK_MS:     111,                            // ~9 тик/с, подставь свой
+    ENEMY_RUN_SPEED:    ENEMY_SPEED,                    // юнит/мс, подставь
+
+    WEAPON_RANGE:       (p) => getWeaponRange(p),       // дальность оружия игрока
+    DANGER_RANGE_MULT:  1.6,     // зона "враг вот-вот достанет"
+
+    TRAP_CATCH_RADIUS:  (trapScale, enemyScale) => trapScale + enemyScale, // условие "поймает"
+
+    RESERVE_SPIKES:     4,       // неприкосновенный запас на анти-инсту
+    RESERVE_TRAPS:      1,
+    PACKET_BUDGET:      5,       // плейсов за тик executor'а, анти-кик
+    VERIFY_TIMEOUT_MS:  350,     // ждём появления объекта
+    ANGLE_RETRY_STEP:   0.15,    // рад, шаг поиска соседнего угла при ретрае
+};
+
+/* ============================================================
+ * ГЕОМЕТРИЯ
+ * ============================================================ */
+const norm = a => Math.atan2(Math.sin(a), Math.cos(a));
+const angDiff = (a, b) => Math.abs(norm(a - b));
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+const angleTo = (from, to) => Math.atan2(to.y - from.y, to.x - from.x);
+
+/* Карта запрещённых дуг вокруг точки origin для предмета itemScale */
+function forbiddenArcs(origin, itemScale, objects) {
+    const d = CFG.PLACE_DIST(itemScale);
+    const arcs = [];
+    for (const o of objects) {
+        const D = dist(origin, o);
+        const R = o.scale + itemScale;          // мин. дистанция центров
+        if (D >= d + R) continue;               // слишком далеко, не мешает
+        if (D <= Math.abs(d - R)) {             // окружность плейса целиком внутри
+            if (D < R - d) return null;         // ВСЁ запрещено (мы внутри объекта)
+            continue;
+        }
+        const phi = angleTo(origin, o);
+        const delta = Math.acos((D*D + d*d - R*R) / (2*D*d));
+        arcs.push([norm(phi - delta), norm(phi + delta)]);
+    }
+    return arcs;
+}
+
+function angleBlocked(theta, arcs) {
+    for (const [a, b] of arcs) {
+        // дуга может пересекать ±π
+        if (a <= b ? (theta >= a && theta <= b)
+                   : (theta >= a || theta <= b)) return true;
+    }
+    return false;
+}
+
+/* Ближайший к desired свободный угол; null если окна нет */
+function findFreeAngle(desired, itemScale, origin, objects, maxDeviation = Math.PI) {
+    const arcs = forbiddenArcs(origin, itemScale, objects);
+    if (arcs === null) return null;
+    if (!angleBlocked(desired, arcs)) return desired;
+    for (let off = CFG.ANGLE_RETRY_STEP; off <= maxDeviation; off += CFG.ANGLE_RETRY_STEP) {
+        if (!angleBlocked(norm(desired + off), arcs)) return norm(desired + off);
+        if (!angleBlocked(norm(desired - off), arcs)) return norm(desired - off);
+    }
+    return null;
+}
+
+/* ============================================================
+ * WORLD TRACKER — скорости через EMA, свои постройки, трапы
+ * ============================================================ */
+class WorldTracker {
+    constructor() { this.hist = new Map(); this.myObjects = new Set(); }
+
+    onPlayerUpdate(p, now) {
+        const h = this.hist.get(p.sid) || { x: p.x, y: p.y, vx: 0, vy: 0, t: now };
+        const dt = Math.max(now - h.t, 1);
+        const ivx = (p.x - h.x) / dt, ivy = (p.y - h.y) / dt;
+        const A = 0.35; // EMA: гасим выбросы кнокбэка, но не убиваем реакцию
+        h.vx = h.vx * (1 - A) + ivx * A;
+        h.vy = h.vy * (1 - A) + ivy * A;
+        // детект кнокбэка: мгновенная скорость >> сглаженной
+        h.knocked = Math.hypot(ivx, ivy) > Math.hypot(h.vx, h.vy) * 2.5 + 0.01;
+        h.kvx = ivx; h.kvy = ivy;
+        h.x = p.x; h.y = p.y; h.t = now;
+        this.hist.set(p.sid, h);
+    }
+
+    /* Позиция через t мс. При кнокбэке — по вектору кнокбэка (затухающему) */
+    predict(sid, t) {
+        const h = this.hist.get(sid);
+        if (!h) return null;
+        const vx = h.knocked ? h.kvx * 0.6 : h.vx;
+        const vy = h.knocked ? h.kvy * 0.6 : h.vy;
+        return { x: h.x + vx * t, y: h.y + vy * t, knocked: h.knocked };
+    }
+
+    /* Игрок в трапе: рядом есть трап, накрывающий его центр, и он почти стоит */
+    trappedBy(pos, sid, objects) {
+        for (const o of objects) {
+            if (!o.isTrap) continue;
+            if (dist(pos, o) < o.scale) {
+                const h = this.hist.get(sid);
+                if (!h || Math.hypot(h.vx, h.vy) < STUCK_SPEED_EPS) return o;
+            }
+        }
+        return null;
+    }
+}
+
+/* ============================================================
+ * ASSESSOR — снимок боевой ситуации
+ * ============================================================ */
+function assess(me, enemy, objects, world, now) {
+    const latency = CFG.PING_MS() + CFG.SERVER_TICK_MS;      // задержка до материализации
+    const meF    = world.predict(me.sid, latency)    || me;   // моя будущая позиция
+    const enemyF = world.predict(enemy.sid, latency) || enemy;
+
+    const d = dist(meF, enemyF);
+    const myTrap    = world.trappedBy(me, me.sid, objects);
+    const enemyTrap = world.trappedBy(enemy, enemy.sid, objects);
+
+    // скорость сближения: проекция относительной скорости на линию боя
+    const hm = world.hist.get(me.sid) || {vx:0,vy:0};
+    const he = world.hist.get(enemy.sid) || {vx:0,vy:0};
+    const lineAng = angleTo(meF, enemyF);
+    const closing = (he.vx - hm.vx) * -Math.cos(lineAng) + (he.vy - hm.vy) * -Math.sin(lineAng);
+
+    return {
+        meF, enemyF, d, latency,
+        angleToEnemy: angleTo(meF, enemyF),
+        myTrap, enemyTrap,
+        closing,                                     // >0 сближаемся, <0 разбегаемся
+        enemyKnocked: !!(world.predict(enemy.sid, 0) || {}).knocked,
+        inDanger: d < CFG.WEAPON_RANGE(enemy) * CFG.DANGER_RANGE_MULT,
+        nearby: objects.filter(o => dist(meF, o) < 300), // только релевантные для дуг
+    };
+}
+
+/* ============================================================
+ * COMPOSER — приоритетная машина сценариев
+ * Возвращает { placements: [{item, angle, prio}], moveHint }
+ * ============================================================ */
+function compose(ctx, resources) {
+    const P = [];
+    let moveHint = null;
+    const SPIKE = CFG.ITEMS.SPIKE, TRAP = CFG.ITEMS.TRAP;
+    const canSpike = n => resources.spikes - n >= CFG.RESERVE_SPIKES;
+    const canTrap  = n => resources.traps  - n >= CFG.RESERVE_TRAPS;
+
+    /* ---------- СЦЕНАРИЙ 1: Я В ТРАПЕ (высший приоритет — выживание) ---- */
+    if (ctx.myTrap) {
+        // Геометрия: пока трап концентричен мне — окна для шипа нет.
+        // Прижимаемся к краю трапа В СТОРОНУ врага → открывается дуга.
+        const offCenter = dist(ctx.meF, ctx.myTrap);
+        moveHint = ctx.angleToEnemy;  // двигаться на врага внутри трапа
+        if (offCenter > EDGE_HUG_THRESHOLD) {
+            // Окно открыто — шип между собой и врагом: он бьёт меня → жрёт шип
+            if (canSpike(1)) P.push({ item: SPIKE, angle: ctx.angleToEnemy, prio: 100 });
+            // Второй — на вектор его обхода (враги орбитят трапнутых)
+            const orbitSide = Math.sign(norm(angleTo(ctx.meF, ctx.enemyF) -
+                                             angleTo(ctx.myTrap, ctx.enemyF))) || 1;
+            if (canSpike(2)) P.push({ item: SPIKE,
+                angle: norm(ctx.angleToEnemy + orbitSide * SPIKE_STEP), prio: 90 });
+        }
+        return { placements: P, moveHint }; // в трапе ничего другого не делаем
+    }
+
+    /* ---------- СЦЕНАРИЙ 2: ВРАГ В ТРАПЕ (запираем, не "дамажим") -------- */
+    if (ctx.enemyTrap) {
+        // Урон шипом невозможен (концентричность, см. геометрию) — закрываем ПОБЕГ.
+        // Побег пойдёт по вектору "от меня" или по последнему вектору движения врага.
+        const escapeAng = angleTo(ctx.meF, ctx.enemyTrap);  // дуга за трапом
+        // Шипы веером на дальней стороне трапа: подходим и кладём 3 шт
+        for (let i = 0; i < 3; i++) {
+            const off = (i - 1) * SPIKE_STEP;  // -step, 0, +step
+            if (canSpike(i + 1))
+                P.push({ item: SPIKE, angle: norm(escapeAng + off), prio: 80 - i });
+        }
+        moveHint = escapeAng; // подсказка: орбитить трап, чтобы дуга плейса доставала
+        return { placements: P, moveHint };
+    }
+
+    /* ---------- СЦЕНАРИЙ 3: ВРАГ В КНОКБЭКЕ (лучший момент для трапа) --- */
+    if (ctx.enemyKnocked && canTrap(1)) {
+        // Траектория детерминирована на latency вперёд — trap по упреждению
+        const d_t = CFG.PLACE_DIST(CFG.ITEMS.TRAP.scale);
+        // Ставим только если предсказанная позиция реально попадёт в catch-радиус
+        const trapPoint = {
+            x: ctx.meF.x + d_t * Math.cos(angleTo(ctx.meF, ctx.enemyF)),
+            y: ctx.meF.y + d_t * Math.sin(angleTo(ctx.meF, ctx.enemyF)),
+        };
+        if (dist(trapPoint, ctx.enemyF) < CFG.TRAP_CATCH_RADIUS(TRAP.scale, CFG.PLAYER_SCALE))
+            P.push({ item: TRAP, angle: angleTo(ctx.meF, ctx.enemyF), prio: 75 });
+    }
+
+    /* ---------- СЦЕНАРИЙ 4: ВРАГ АТАКУЕТ / СБЛИЖАЕТСЯ -------------------- */
+    if (ctx.inDanger && ctx.closing > 0) {
+        // Трап на упреждённую точку входа + шип-прикрытие сбоку от вектора атаки
+        if (canTrap(1))
+            P.push({ item: TRAP, angle: ctx.angleToEnemy, prio: 70 });
+        if (canSpike(1))
+            P.push({ item: SPIKE, angle: norm(ctx.angleToEnemy + TRAP_SPIKE_STEP), prio: 60 });
+        if (canSpike(2))
+            P.push({ item: SPIKE, angle: norm(ctx.angleToEnemy - TRAP_SPIKE_STEP), prio: 59 });
+        return { placements: P, moveHint };
+    }
+
+    /* ---------- СЦЕНАРИЙ 5: МЕНЯ ПРЕСЛЕДУЮТ (я отступаю) ----------------- */
+    if (ctx.closing > 0 && !ctx.inDanger && isRetreating(ctx)) {
+        // Шипы ЗА спину, на линию преследования — догоняющий влетает в них
+        const backAng = norm(ctx.angleToEnemy); // враг сзади → угол на него = за спину
+        if (canSpike(1)) P.push({ item: SPIKE, angle: backAng, prio: 50 });
+        // Трап за спину, если враг близко к линии — ловля на догоне
+        if (ctx.d < CHASE_TRAP_RANGE && canTrap(1))
+            P.push({ item: TRAP, angle: backAng, prio: 55 });
+        return { placements: P, moveHint };
+    }
+
+    /* ---------- СЦЕНАРИЙ 6: ВРАГ УБЕГАЕТ --------------------------------- */
+    if (ctx.closing < 0 && ctx.d < CHASE_TRAP_RANGE && canTrap(1)) {
+        // Упреждение по ЕГО вектору, а не по линии боя
+        P.push({ item: TRAP, angle: angleTo(ctx.meF, ctx.enemyF), prio: 40 });
+    }
+
+    return { placements: P, moveHint };
+}
+
+/* ============================================================
+ * EXECUTOR — очередь, валидация дуг, верификация, ретраи
+ * ============================================================ */
+class Executor {
+    constructor(world) {
+        this.world = world;
+        this.pending = [];  // ждут верификации: {point, item, sentAt, angle}
+    }
+
+    run(plan, ctx) {
+        let budget = CFG.PACKET_BUDGET;
+        plan.placements.sort((a, b) => b.prio - a.prio);
+
+        for (const pl of plan.placements) {
+            if (budget <= 0) break;
+
+            // 1) Валидация: свободен ли угол с учётом ВСЕХ объектов + трапов
+            const angle = findFreeAngle(pl.angle, pl.item.scale,
+                                        ctx.meF, ctx.nearby, MAX_ANGLE_DEVIATION);
+            if (angle === null) continue;   // окна нет — не жжём пакет впустую
+
+            // 2) Дедупликация: не ставим туда, где уже стоит наш объект
+            const d = CFG.PLACE_DIST(pl.item.scale);
+            const point = { x: ctx.meF.x + d * Math.cos(angle),
+                            y: ctx.meF.y + d * Math.sin(angle) };
+            if (this.duplicateExists(point, pl.item)) continue;
+
+            // 3) Отправка: предмет → плейс → вернуть оружие
+            sendSelectItem(pl.item.slot);
+            sendPlace(angle);                     // place(player.items[slot], angle)
+            sendSelectWeapon(currentWeapon());    // КРИТИЧНО: рука обратно на оружие
+
+            this.pending.push({ point, item: pl.item, angle,
+                                desired: pl.angle, sentAt: Date.now(), prio: pl.prio });
+            budget--;
+        }
+    }
+
+    /* Вызывать на каждом обновлении objects от сервера */
+    verify(objects, ctx) {
+        const now = Date.now();
+        this.pending = this.pending.filter(p => {
+            const appeared = objects.some(o =>
+                dist(o, p.point) < p.item.scale * 0.8);
+            if (appeared) return false;                       // успех
+            if (now - p.sentAt < CFG.VERIFY_TIMEOUT_MS) return true; // ещё ждём
+            // Фейл: ретрай со сдвигом угла — раз в этот угол нельзя, ищем рядом
+            const retry = findFreeAngle(
+                norm(p.desired + Math.sign(norm(p.angle - p.desired) || 1) * CFG.ANGLE_RETRY_STEP),
+                p.item.scale, ctx.meF, ctx.nearby, MAX_ANGLE_DEVIATION);
+            if (retry !== null && p.prio >= RETRY_MIN_PRIO) {
+                sendSelectItem(p.item.slot);
+                sendPlace(retry);
+                sendSelectWeapon(currentWeapon());
+            }
+            return false;
+        });
+    }
+
+    duplicateExists(point, item) {
+        for (const o of this.world.myObjects)
+            if (dist(o, point) < item.scale + o.scale - DUP_TOLERANCE) return true;
+        return false;
+    }
+}
+
+/* ============================================================
+ * ГЛАВНЫЙ ЦИКЛ — хук на серверный апдейт, НЕ setInterval
+ * ============================================================ */
+const world = new WorldTracker();
+const executor = new Executor(world);
+
+onServerUpdate((me, players, objects, now) => {
+    for (const p of players) world.onPlayerUpdate(p, now);
+
+    executor.verify(objects, lastCtx);          // сверка прошлых плейсов
+
+    const enemy = nearestEnemy(me, players);
+    if (!enemy) return;
+
+    const ctx = assess(me, enemy, objects, world, now);
+    lastCtx = ctx;
+
+    const plan = compose(ctx, getResources(me));
+    executor.run(plan, ctx);
+
+    if (plan.moveHint !== null) applyMoveHint(plan.moveHint); // опционально
+});
+```
+
+---
+
+## Часть 4. Почему это не подведёт — по пунктам твоих условий
+
+| Условие боя | Что отрабатывает |
+|---|---|
+| **Движение (обоих)** | Все углы считаются от `meF` и `enemyF` — экстраполяция на `ping + серверный тик`. Пакет прилетает на сервер, когда позиции уже совпали с расчётом. |
+| **Удар / отскок врага** | Детектор кнокбэка (мгновенная скорость ≫ EMA). Кнокбэк = детерминированная траектория = сценарий 3, трап по упреждению с проверкой, что catch-радиус реально накроет. Без проверки — не тратим трап. |
+| **Я в трапе** | Сценарий 1 знает про концентричность: не спамит фейлы, а даёт `moveHint` прижаться к краю, и только когда `offCenter` открыл дугу — кладёт шип на вектор атаки. |
+| **Враг в трапе** | Сценарий 2 знает, что урона не будет — закрывает дугу побега веером за трапом, а не «в лицо». |
+| **Композиция боя** | `closing` (скорость сближения по линии боя) + `inDanger` + направление моего движения → 6 дискретных сценариев с приоритетами, включая «меня кайтят» (шипы за спину). |
+| **Плейс не прошёл** | Аналитические запрещённые дуги **до** отправки + верификация появления объекта **после** + ретрай со сдвигом угла. Три эшелона. |
+| **Ресурсы** | Резерв под анти-инсту неприкосновенен, каждый сценарий проверяет `canSpike/canTrap` нарастающим итогом. |
+| **Кик за спам** | Пакетный бюджет за тик, дедупликация против своих же построек. |
+
+**Два принципиальных решения**, отличающих это от типичных скриптов: (1) цикл висит на серверном апдейте, а не на `setInterval` — решения синхронны с реальностью, а не с локальным таймером; (2) система никогда не шлёт пакет, в успехе которого не уверена геометрически, а если сервер всё же отказал — узнаёт об этом по факту отсутствия объекта и адаптируется.
+
+Подставляй константы (`SPIKE_STEP` ≈ твой минимальный шаг шип–шип, `TRAP_SPIKE_STEP` ≈ мин. угол трап–шип из прошлых расчётов, `STUCK_SPEED_EPS`, пороги дистанций) и прогоняй. Если что-то из хуков (`onServerUpdate`, `sendPlace`) у тебя устроено иначе — скажи как, перепишу связку.
+
+# Auto-Replace: механика, философия, прототип
+
+## Часть 1. Почему replace — это не «поставить заново», а самое сильное окно в игре
+
+### 1.1 Что такое момент KillObject на самом деле
+
+`KillObject(sid)` — сервер сообщает: объект умер. Ключевое: **этот пакет приходит раньше**, чем ты визуально осознаешь пропажу, и раньше, чем враг получит подтверждение свободного пространства у себя. Враг, ломающий твой трап, планирует движение **на следующий тик после** брейка. Если твой плейс-пакет уходит внутри обработчика KillObject — он попадает на сервер **в тот же или следующий тик**, то есть раньше, чем враг успеет сместиться из catch-радиуса.
+
+Отсюда легендарная связка: **враг ломает трап, будучи внутри него → мгновенный re-trap → враг снова пойман**. При достаточных ресурсах это бесконечная цепь. Враг физически не может выйти: скорость бега за один тик меньше, чем catch-радиус трапа.
+
+### 1.2 Три неочевидные проблемы, которые ломают наивный replace
+
+**Проблема A: мёртвый объект — призрак в списке.** В момент KillObject локальный список объектов может ещё содержать умерший объект. Если посчитать запрещённые дуги по нему — своё же место окажется «занято» и валидатор откажет. **Мёртвый sid обязан быть исключён из препятствий до расчёта дуг.**
+
+**Проблема B: ты сместился.** Плейс работает только на фиксированной дистанции `d` от тебя. Объект стоял в точке `P`, но ты двигался — новый объект под углом на `P` встанет в точку `P'`≠`P`. Replace валиден, только если `P'` всё ещё выполняет **тактическую роль** старого объекта (держит врага, закрывает дугу побега). Значит, реплейсим не «позицию», а **роль**.
+
+**Проблема C: бейтинг.** Умный враг ломает твои шипы с безопасной дистанции копьём, заставляя тебя сжигать ресурсы на реплейсы. Наивный replace — это кран, из которого враг сливает твой камень. Нужен детектор: **ломают → но не сближаются → это дойка, перекрыть кран.**
+
+### 1.3 Секретное оружие: предиктивный replace (pre-arm)
+
+Реагировать на KillObject — хорошо. Но можно лучше. Мы **видим каждый удар** по нашему объекту (хит-эффект/wiggle-пакет). Мы знаем HP объекта и урон оружия врага. Значит, мы знаем, **какой по счёту удар станет смертельным**. 
+
+За один удар до смерти объекта мы **заранее полностью вычисляем** реплейс: угол, валидацию дуг (без умирающего объекта), готовим пакет. Когда KillObject приходит — вычислять нечего, пакет **уже собран**, уходит за микросекунды. Это минимально возможная физическая задержка реакции. Вот что делает комбинацию непобедимой: враг соревнуется с заранее заряженным ружьём.
+
+---
+
+## Часть 2. Архитектура: как replace и place становятся одним организмом
+
+```
+                    ┌─────────────────────────────┐
+   onServerUpdate → │  AutoPlace (Composer)       │──┐
+                    └─────────────────────────────┘  │    ┌──────────────┐
+                    ┌─────────────────────────────┐  ├──→ │  Executor    │→ пакеты
+   onObjectHit    → │  BreakPredictor (pre-arm)   │──┤    │ (общий:      │
+                    └─────────────────────────────┘  │    │  дуги, бюджет│
+                    ┌─────────────────────────────┐  │    │  верификация)│
+   onKillObject   → │  ReplaceManager             │──┘    └──────────────┘
+                    └─────────────────────────────┘
+                              ↑↓
+                    ┌─────────────────────────────┐
+                    │  PlacementRegistry           │  ← роли, родословные, лимиты
+                    └─────────────────────────────┘
+```
+
+**Ключ к симбиозу — PlacementRegistry.** AutoPlace при каждом успешном плейсе записывает не только «объект поставлен», но и **зачем**: роль, цель, контекст. Replace потом реплейсит не координату, а **намерение**. А KillObject в обратную сторону будит AutoPlace: умер объект → освободился лимит построек → возможно, отложенный сценарий теперь выполним.
+
+---
+
+## Часть 3. Прототип
+
+```js
+/* ============================================================
+ * РОЛИ ПОСТРОЕК — язык, на котором говорят place и replace
+ * ============================================================ */
+const ROLE = {
+    TRAP_HOLD:     'trap_hold',      // трап, держащий врага — святое
+    ESCAPE_BLOCK:  'escape_block',   // шип, запирающий дугу побега
+    DEFENSE:       'defense',        // шип между мной и врагом
+    CHASE_TRAP:    'chase_trap',     // трап на упреждение/погоню
+    BACK_COVER:    'back_cover',     // шип за спину при отступлении
+};
+
+/* Политика реплейса по ролям: приоритет, можно ли трогать резерв,
+ * максимум реплейсов в цепи, условие актуальности роли */
+const REPLACE_POLICY = {
+    [ROLE.TRAP_HOLD]: {
+        prio: 110,                    // выше всего, что делает autoplace
+        useReserve: true,             // цепь ре-трапа = добивание, резерв можно
+        maxChain: TRAP_CHAIN_LIMIT,   // напр. 6 — дальше это уже не бой, а дойка
+        stillRelevant: (ctx, meta) =>
+            dist(ctx.enemyF, meta.point) < RETRAP_CATCH_WINDOW, // враг ещё в зоне
+    },
+    [ROLE.ESCAPE_BLOCK]: {
+        prio: 95, useReserve: false, maxChain: 3,
+        stillRelevant: (ctx, meta) => !!ctx.enemyTrap, // враг всё ещё трапнут
+    },
+    [ROLE.DEFENSE]: {
+        prio: 85, useReserve: false, maxChain: 4,
+        stillRelevant: (ctx, meta) =>
+            ctx.inDanger && angDiff(ctx.angleToEnemy, meta.desiredAngle) < DEF_ARC_TOL,
+    },
+    [ROLE.CHASE_TRAP]: {
+        prio: 0,  useReserve: false, maxChain: 0,   // одноразовый, не реплейсим
+        stillRelevant: () => false,
+    },
+    [ROLE.BACK_COVER]: {
+        prio: 45, useReserve: false, maxChain: 2,
+        stillRelevant: (ctx) => ctx.closing > 0 && isRetreating(ctx),
+    },
+};
+
+/* ============================================================
+ * PLACEMENT REGISTRY — память о намерениях
+ * ============================================================ */
+class PlacementRegistry {
+    constructor() {
+        this.bySid   = new Map();  // sid → meta
+        this.orphans = [];         // подтверждённые плейсы, ждущие sid от сервера
+    }
+
+    /* Executor зовёт при отправке успешно провалидированного плейса */
+    expect(point, item, role, desiredAngle, lineage) {
+        this.orphans.push({ point, item, role, desiredAngle,
+                            lineage: lineage || newLineageId(),
+                            chainCount: lineage ? lineage.chain + 1 : 0,
+                            bornAt: Date.now() });
+    }
+
+    /* Вызывать при появлении нового объекта в апдейте — сшиваем sid с метой */
+    adopt(obj) {
+        const i = this.orphans.findIndex(o =>
+            dist(o.point, obj) < o.item.scale * 0.8);
+        if (i === -1) return;
+        const meta = this.orphans.splice(i, 1)[0];
+        meta.sid = obj.sid;
+        meta.point = { x: obj.x, y: obj.y };     // точные серверные координаты
+        meta.hp = OBJECT_MAX_HP(meta.item);       // напр. spike hp, trap hp
+        this.bySid.set(obj.sid, meta);
+    }
+
+    take(sid) { const m = this.bySid.get(sid); this.bySid.delete(sid); return m; }
+    get(sid)  { return this.bySid.get(sid); }
+}
+
+/* ============================================================
+ * BAIT DETECTOR — перекрываем кран для доярок
+ * ============================================================ */
+class BaitDetector {
+    constructor() { this.breaks = []; }   // {t, enemyDistAtBreak, closingAtBreak}
+
+    onBreak(ctx) {
+        const now = Date.now();
+        this.breaks.push({ t: now, d: ctx.d, closing: ctx.closing });
+        this.breaks = this.breaks.filter(b => now - b.t < BAIT_WINDOW_MS); // напр. 8000
+    }
+
+    /* Дойка = ломает много, но не сближается и не в моей опасной зоне */
+    isBaiting(ctx) {
+        if (this.breaks.length < BAIT_MIN_BREAKS) return false;      // напр. 3
+        const avgClosing = this.breaks.reduce((s, b) => s + b.closing, 0)
+                         / this.breaks.length;
+        return avgClosing < BAIT_CLOSING_EPS && !ctx.inDanger;
+    }
+}
+
+/* ============================================================
+ * BREAK PREDICTOR — pre-arm: пакет готов ДО смерти объекта
+ * ============================================================ */
+class BreakPredictor {
+    constructor(registry, replaceMgr) {
+        this.registry = registry;
+        this.replaceMgr = replaceMgr;
+        this.armed = new Map();   // sid → готовый план реплейса
+    }
+
+    /* Хук на событие удара по объекту (wiggle / hit-эффект) */
+    onObjectHit(sid, attacker) {
+        const meta = this.registry.get(sid);
+        if (!meta) return;
+
+        const dmg = WEAPON_OBJECT_DAMAGE(attacker);  // урон оружия по постройкам
+        meta.hp -= dmg;
+
+        // Умрёт со следующего удара? → полная подготовка реплейса СЕЙЧАС
+        if (meta.hp <= dmg && !this.armed.has(sid)) {
+            const plan = this.replaceMgr.buildReplacePlan(meta, /*excludeSid=*/sid);
+            if (plan) this.armed.set(sid, { plan, armedAt: Date.now() });
+        }
+    }
+
+    takeArmed(sid) {
+        const a = this.armed.get(sid);
+        this.armed.delete(sid);
+        // план протухает: за это время бой мог уехать (напр. 400мс)
+        if (a && Date.now() - a.armedAt < PREARM_TTL_MS) return a.plan;
+        return null;
+    }
+}
+
+/* ============================================================
+ * REPLACE MANAGER — сердце. Живёт внутри KillObject
+ * ============================================================ */
+class ReplaceManager {
+    constructor(registry, executor, world, bait) {
+        this.registry = registry;
+        this.executor = executor;
+        this.world = world;
+        this.bait = bait;
+        this.predictor = null; // связывается после создания BreakPredictor
+    }
+
+    /* ═══ ГЛАВНЫЙ ХУК ═══ вызывается из KillObject(sid) */
+    onKillObject(sid) {
+        const meta = this.registry.take(sid);
+        if (!meta) return;                        // не наш объект — не наше дело
+
+        const ctx = freshContext(sid);            // assess() с ИСКЛЮЧЁННЫМ sid!
+                                                  // (проблема A: труп не препятствие)
+        this.bait.onBreak(ctx);
+
+        /* ---- Путь 1: молниеносный — пакет заряжен предиктором ---- */
+        const armed = this.predictor.takeArmed(sid);
+        if (armed && this.roleStillAlive(meta, ctx)) {
+            this.executor.injectImmediate(armed, ctx);   // ноль вычислений, сразу wire
+            this.registry.expect(armed.point, meta.item, meta.role,
+                                 meta.desiredAngle, meta);        // наследуем lineage
+            return;
+        }
+
+        /* ---- Путь 2: обычный — вычисляем на месте (всё ещё внутри тика) ---- */
+        if (!this.roleStillAlive(meta, ctx)) {
+            // Роль мертва — но смерть объекта освободила ЛИМИТ построек.
+            // Будим autoplace: отложенные сценарии могли стать выполнимыми.
+            notifyCapacityFreed(meta.item);
+            return;
+        }
+
+        const plan = this.buildReplacePlan(meta, sid, ctx);
+        if (plan) {
+            this.executor.injectImmediate(plan, ctx);
+            this.registry.expect(plan.point, meta.item, meta.role,
+                                 meta.desiredAngle, meta);
+        } else {
+            // Своё место недостижимо (я далеко/дуга закрыта) —
+            // деградация в autoplace: пусть composer решит по текущей картине,
+            // передаём осиротевшую роль как подсказку приоритета
+            requestComposeWithHint(meta.role, meta.point);
+        }
+    }
+
+    /* Жива ли тактическая роль + анти-бейт + лимит цепи */
+    roleStillAlive(meta, ctx) {
+        const pol = REPLACE_POLICY[meta.role];
+        if (!pol || pol.prio === 0) return false;
+        if (meta.chainCount >= pol.maxChain) return false;         // цепь исчерпана
+
+        // Анти-бейт НЕ душит ре-трап пойманного — это добивание, не дойка
+        if (meta.role !== ROLE.TRAP_HOLD && this.bait.isBaiting(ctx)) return false;
+
+        if (!pol.stillRelevant(ctx, meta)) return false;
+
+        const res = getResources();
+        const isTrap = meta.item.slot === CFG.ITEMS.TRAP.slot;
+        const pool = isTrap ? res.traps : res.spikes;
+        const reserve = isTrap ? CFG.RESERVE_TRAPS : CFG.RESERVE_SPIKES;
+        return pol.useReserve ? pool >= 1 : pool - 1 >= reserve;
+    }
+
+    /* Построить план: воспроизвести РОЛЬ из текущей позиции игрока */
+    buildReplacePlan(meta, excludeSid, ctx = freshContext(excludeSid)) {
+        const pol = REPLACE_POLICY[meta.role];
+        const d = CFG.PLACE_DIST(meta.item.scale);
+
+        /* Целевой угол зависит от роли, а не от старой координаты: */
+        let desired;
+        switch (meta.role) {
+            case ROLE.TRAP_HOLD:
+                // Ре-трап кладём на ПРЕДСКАЗАННОГО врага, не на старую точку —
+                // он мог начать выбегать, ловим его будущего
+                desired = angleTo(ctx.meF, ctx.enemyF);
+                break;
+            case ROLE.ESCAPE_BLOCK:
+                // Дуга побега считается от АКТУАЛЬНОГО трапа врага
+                desired = angleTo(ctx.meF, ctx.enemyTrap || meta.point);
+                break;
+            case ROLE.DEFENSE:
+                desired = ctx.angleToEnemy;              // стена едет за вектором боя
+                break;
+            default:
+                desired = angleTo(ctx.meF, meta.point);  // прочие — к старой точке
+        }
+
+        const nearby = ctx.nearby.filter(o => o.sid !== excludeSid); // без трупа
+        const angle = findFreeAngle(desired, meta.item.scale,
+                                    ctx.meF, nearby, MAX_ANGLE_DEVIATION);
+        if (angle === null) return null;
+
+        const point = { x: ctx.meF.x + d * Math.cos(angle),
+                        y: ctx.meF.y + d * Math.sin(angle) };
+
+        /* Проверка эквивалентности: новая точка реально выполняет роль? */
+        if (meta.role === ROLE.TRAP_HOLD &&
+            dist(point, ctx.enemyF) > CFG.TRAP_CATCH_RADIUS(meta.item.scale,
+                                                            CFG.PLAYER_SCALE))
+            return null;   // трап встанет мимо врага — не жжём его впустую
+        if (meta.role === ROLE.ESCAPE_BLOCK && ctx.enemyTrap &&
+            dist(point, meta.point) > BLOCK_EQUIV_TOLERANCE)
+            return null;   // дыра в заборе останется дырой — пусть composer решает
+
+        return { item: meta.item, angle, point, prio: pol.prio,
+                 desiredAngle: desired };
+    }
+}
+
+/* ============================================================
+ * EXECUTOR — дополнение: мгновенная инъекция вне очереди
+ * ============================================================ */
+Executor.prototype.injectImmediate = function(plan, ctx) {
+    // Реплейсы идут вне пакетного бюджета composer'а, но со своим лимитом,
+    // чтобы цепь ре-трапов не словила кик
+    if (this.replaceBudgetUsed >= REPLACE_BUDGET_PER_TICK) {
+        this.queueNextTick(plan);   // не потерять, а отложить на тик
+        return;
+    }
+    this.replaceBudgetUsed++;
+
+    sendSelectItem(plan.item.slot);
+    sendPlace(plan.angle);
+    sendSelectWeapon(currentWeapon());   // рука обратно на оружие — всегда
+
+    this.pending.push({ point: plan.point, item: plan.item, angle: plan.angle,
+                        desired: plan.desiredAngle, sentAt: Date.now(),
+                        prio: plan.prio });
+};
+
+/* ============================================================
+ * СШИВКА ВСЕЙ СИСТЕМЫ
+ * ============================================================ */
+const registry   = new PlacementRegistry();
+const bait       = new BaitDetector();
+const replaceMgr = new ReplaceManager(registry, executor, world, bait);
+const predictor  = new BreakPredictor(registry, replaceMgr);
+replaceMgr.predictor = predictor;
+
+/* Хук №1: смерть объекта — точка входа replace */
+hookKillObject((sid) => {
+    replaceMgr.onKillObject(sid);
+    removeLocalObject(sid);          // труп вон из локального списка (проблема A)
+});
+
+/* Хук №2: удар по объекту — топливо предиктора */
+hookObjectHit((sid, attackerSid) => {
+    predictor.onObjectHit(sid, getPlayer(attackerSid));
+});
+
+/* Хук №3: расширение главного цикла autoplace */
+onServerUpdate((me, players, objects, now) => {
+    executor.replaceBudgetUsed = 0;
+    executor.flushQueued();                    // отложенные реплейсы — первыми
+    for (const o of newObjects(objects)) registry.adopt(o);  // сшивка sid↔мета
+    // ... далее прежний цикл autoplace (verify → assess → compose → run)
+    // Executor.run при отправке теперь зовёт registry.expect(point, item,
+    //   role, angle) — composer помечает каждый плейс ролью из сценария
+});
+```
+
+---
+
+## Часть 4. Как связка превосходит любого — сценарии боя
+
+| Ситуация | Что делает система | Почему враг проигрывает |
+|---|---|---|
+| Враг ломает трап, стоя в нём | Predictor зарядил пакет за удар до смерти → KillObject → re-trap за микросекунды, угол на **предсказанного** врага | Его скорость × 1 тик < catch-радиус. Он снова пойман. Цепь до `maxChain` — этого хватает добить кого угодно |
+| Враг ломает мой ESCAPE_BLOCK, чтобы выбежать из трапа | Реплейс дыры в заборе с проверкой эквивалентности; если я отошёл и дыра не закроется — composer получает hint и перестраивает забор целиком | Он потратил удары на шип, а забор снова цел. Тем временем autoplace держит его в трапе |
+| Враг копьём доит мои шипы с дистанции | BaitDetector: ломает ≥N, closing≈0, не в опасной зоне → реплейс DEFENSE отключён | Кран перекрыт. Он потратил время и дюру оружия впустую, я — ноль ресурсов |
+| Мой DEFENSE-шип сломан в гуще размена | Роль жива (inDanger, вектор совпадает) → мгновенная стена заново, **вне** бюджета composer'а | В его комбо была дырка на 1 тик — она закрылась раньше, чем он в неё шагнул |
+| Объект умер, а бой уехал | `stillRelevant` = false → реплейса нет, но `notifyCapacityFreed` будит composer: лимит построек освободился | Ни одного ресурса в пустоту; освободившийся лимит тут же работает на актуальный сценарий |
+| Я далеко от умершего объекта | `buildReplacePlan` видит, что новая точка не выполнит роль → деградация в composer с подсказкой | Система никогда не ставит объект «примерно туда» — только осмысленно |
+
+**Почему это именно симбиоз, а не два скрипта рядом:** общий Executor (одни дуги, одна верификация, один анти-кик), общий Registry (place помечает намерения → replace их наследует → composer узнаёт об освободившихся лимитах), общий BaitDetector-контекст. AutoPlace создаёт композицию, AutoReplace делает её **несносимой**, а предиктор сжимает время реакции до физического минимума — до скорости прихода пакета.
+
+Подставь свои: `WEAPON_OBJECT_DAMAGE`, `OBJECT_MAX_HP`, `RETRAP_CATCH_WINDOW` (≈ trap.scale + player.scale + запас на тик бега), `TRAP_CHAIN_LIMIT`, `BAIT_*`, `PREARM_TTL_MS`, `REPLACE_BUDGET_PER_TICK` — и хуки `hookKillObject`/`hookObjectHit` на свои точки перехвата. Если хит-события у тебя не перехватываются — скажи, предиктор можно переключить на подсчёт по анимациям атаки врага в радиусе досягаемости объекта.
